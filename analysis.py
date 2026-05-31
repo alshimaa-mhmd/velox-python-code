@@ -1,44 +1,33 @@
-# new ENGINE
 import pandas as pd
+import numpy as np
 import json
+from sklearn.linear_model import LinearRegression
 
 # ======================
 # 1) Cleaning Functions
 # ======================
-
 def clean_data(df, price_col, cost_col=None):
     original_rows = len(df)
-
-    # إزالة الصفوف المكررة تماماً
     df = df.drop_duplicates()
     duplicates_removed = original_rows - len(df)
-
-    # تنظيف القيم الفارغة
     df = df[df[price_col].notnull()]
-
     if cost_col:
         df[cost_col] = df[cost_col].fillna(df[cost_col].median())
-
     missing_percentage = df.isnull().mean().mean() * 100
-
     return df, duplicates_removed, missing_percentage
 
-# تم التعديل: نعد القيم الشاذة فقط ولا نحذفها لكي يتطابق الإجمالي مع الإكسيل
 def count_outliers(df, column):
     Q1 = df[column].quantile(0.25)
     Q3 = df[column].quantile(0.75)
     IQR = Q3 - Q1
-
     lower = Q1 - 1.5 * IQR
     upper = Q3 + 1.5 * IQR
-
     outliers = df[(df[column] < lower) | (df[column] > upper)]
     return len(outliers)
 
 # ======================
-# 2) Main Engine
+# 2) Main Engine 
 # ======================
-
 def analyze_data(file_path, start_date=None, end_date=None):
     try:
         if file_path.endswith('.xlsx'):
@@ -48,60 +37,58 @@ def analyze_data(file_path, start_date=None, end_date=None):
             
         df.columns = df.columns.str.strip().str.lower()
 
-        # ======================
-        # Smart Column Detection
-        # ======================
         aliases = {
             "price": ["sales", "revenue", "total", "amount", "price"],
             "cost": ["cogs", "cost", "expense"],
             "profit": ["gross income", "net income", "profit", "gain", "income", "margin"],
             "date": ["date", "order_date"],
             "product": ["product", "item", "product line", "product_name"],
-            "region": ["region", "country", "city", "branch"]
+            "region": ["region", "country", "city", "branch"],
+            "quantity": ["quantity", "qty", "count"],
+            "category": ["category", "department", "group"] # search for category 
         }
 
         def detect(possible_aliases, is_money=False):
-            # 1. البحث عن تطابق كامل أولاً (لضمان الدقة)
             for name in possible_aliases:
                 for col in df.columns:
-                    if name == col:
-                        return col
-            # 2. البحث عن تطابق جزئي
+                    if name == col: return col
             for name in possible_aliases:
                 for col in df.columns:
-                    # تجاهل أعمدة النسب المئوية في الحسابات المالية
-                    if is_money and ("percentage" in col or "%" in col or "rate" in col):
-                        continue
-                    if name in col:
-                        return col
+                    if is_money and ("percentage" in col or "%" in col or "rate" in col): continue
+                    if name in col: return col
             return None
 
-        # تحديد الأعمدة بذكاء
         price = detect(aliases["price"], is_money=True)
         cost = detect(aliases["cost"], is_money=True)
         profit_col = detect(aliases["profit"], is_money=True)
         date = detect(aliases["date"])
         product = detect(aliases["product"])
+        category_col = detect(aliases["category"]) # I'v added this line to detect if the category existing 
         region = detect(aliases["region"])
-
-        if not price or not date:
-            return {"status": "error", "message": f"Missing required columns. Found: {df.columns.tolist()}"}
+        qty_col = detect(aliases["quantity"])
 
         # ======================
-        # Cleaning
+        # Validation & Missing Columns Logic
         # ======================
-        df, duplicates_removed, missing_percentage = clean_data(df, price, cost)
-        outliers_detected = count_outliers(df, price) # نعدهم فقط
-
-        # ======================
-        # Prepare Data & Date Filtering
-        # ======================
-        df[date] = pd.to_datetime(df[date], errors="coerce")
+        missing_required = []
         
-        if start_date:
-            df = df[df[date] >= pd.to_datetime(start_date)]
-        if end_date:
-            df = df[df[date] <= pd.to_datetime(end_date)]
+        if not price:
+            missing_required.append("Price/Revenue")
+        if not date:
+            missing_required.append("Date")
+        # Return the missing 
+        if missing_required:
+            missing_str = " and ".join(missing_required)
+            return {
+                "status": "error", 
+                "message": f"Cannot analyze the file. Missing required columns: {missing_str}."
+            }
+        df, duplicates_removed, missing_percentage = clean_data(df, price, cost)
+        outliers_detected = count_outliers(df, price)
+
+        df[date] = pd.to_datetime(df[date], errors="coerce")
+        if start_date: df = df[df[date] >= pd.to_datetime(start_date)]
+        if end_date: df = df[df[date] <= pd.to_datetime(end_date)]
             
         if df.empty:
              return {"status": "error", "message": "No data available for the selected date range."}
@@ -109,31 +96,21 @@ def analyze_data(file_path, start_date=None, end_date=None):
         df["month"] = df[date].dt.strftime("%Y-%m")
         df["revenue"] = df[price]
 
-        # ======================
-        # Profit Logic
-        # ======================
-        if profit_col:
-            df["profit"] = df[profit_col]
-        elif cost:
-            df["profit"] = df[price] - df[cost]
-        else:
-            df["profit"] = df["revenue"] * 0.3
+        if profit_col: df["profit"] = df[profit_col]
+        elif cost: df["profit"] = df[price] - df[cost]
+        else: df["profit"] = df["revenue"] * 0.3
 
-        # ======================
-        # KPIs
-        # ======================
         total_revenue = float(df["revenue"].sum())
         total_profit = float(df["profit"].sum())
         total_orders = int(len(df))
-
         profit_margin = (total_profit / total_revenue) * 100 if total_revenue else 0.0
 
-        # ======================
-        # Charts Data Prep
-        # ======================
         sales_over_time = df.groupby("month")["revenue"].sum().fillna(0).reset_index().to_dict(orient="records")
         profit_over_time = df.groupby("month")["profit"].sum().fillna(0).reset_index().to_dict(orient="records")
-
+        
+        best_product = worst_product = None
+        top_products = bottom_products = []
+        
         if product:
             product_profit = df.groupby(product)["profit"].sum().fillna(0).reset_index().sort_values("profit", ascending=False)
             product_profit = product_profit.rename(columns={product: "productName"})
@@ -141,60 +118,108 @@ def analyze_data(file_path, start_date=None, end_date=None):
             if not product_profit.empty:
                 best_product = str(product_profit.iloc[0]["productName"])
                 worst_product = str(product_profit.iloc[-1]["productName"])
-                
                 num_products = len(product_profit)
                 
-                # حل مشكلة تكرار المنتجات إذا كانت أقل من 20
                 if num_products >= 20:
                     top_products = product_profit.head(20).to_dict(orient="records")
                     bottom_products = product_profit.tail(20).to_dict(orient="records")
                 else:
                     mid = num_products // 2
-                    if mid == 0:
-                        top_products = product_profit.to_dict(orient="records")
-                        bottom_products = []
-                    else:
-                        top_products = product_profit.head(mid).to_dict(orient="records")
-                        bottom_products = product_profit.tail(num_products - mid).to_dict(orient="records")
-            else:
-                best_product = worst_product = None
-                top_products = bottom_products = []
-        else:
-            best_product = worst_product = None
-            top_products = bottom_products = []
+                    top_products = product_profit.head(mid).to_dict(orient="records") if mid > 0 else product_profit.to_dict(orient="records")
+                    bottom_products = product_profit.tail(num_products - mid).to_dict(orient="records") if mid > 0 else []
 
-# توحيد اسم مفتاح المناطق (Normalization)
         sales_by_region = []
         if region:
             region_df = df.groupby(region)["revenue"].sum().fillna(0).reset_index()
-            region_df = region_df.rename(columns={region: "region"}) # توحيد الاسم لـ region
+            region_df = region_df.rename(columns={region: "region"}) 
             sales_by_region = region_df.to_dict(orient="records")
 
-        # ======================
-        # Growth & Insights
-        # ======================
-        monthly = df.groupby(df[date].dt.to_period("M"))["revenue"].sum()
-        growth = float(monthly.pct_change().iloc[-1] * 100) if len(monthly) > 1 else None
+        monthly_series = df.groupby(df[date].dt.to_period("M"))["revenue"].sum()
+        growth = float(monthly_series.pct_change().iloc[-1] * 100) if len(monthly_series) > 1 else 0.0
 
-        insights = []
-        if growth is not None: insights.append(f"Revenue changed by {round(growth, 2)}% last month")
-        insights.append(f"Total profit is {round(total_profit, 2)}")
-        insights.append(f"Profit margin is {round(profit_margin, 2)}%")
-        if best_product: insights.append(f"{best_product} is the most profitable product")
-        if worst_product: insights.append(f"{worst_product} is the least profitable product")
-        if missing_percentage > 10: insights.append("High missing values detected")
-        if outliers_detected > 0: insights.append(f"{outliers_detected} unusual high sales were detected")
+        # Forecasting Engine Logic
+        forecast_data = []
+        monthly_df = df.groupby(df[date].dt.to_period("M"))["revenue"].sum().reset_index()
+        if len(monthly_df) >= 2:
+            monthly_df['time_index'] = np.arange(len(monthly_df))
+            X = monthly_df[['time_index']]
+            y = monthly_df['revenue']
+            
+            model = LinearRegression()
+            model.fit(X, y)
+            
+            last_index = monthly_df['time_index'].iloc[-1]
+            last_date_obj = df[date].max()
+            
+            future_indices = np.arange(last_index + 1, last_index + 1 + 3).reshape(-1, 1)
+            predictions = model.predict(future_indices)
+            
+            for i, pred in enumerate(predictions):
+                next_month = (last_date_obj + pd.DateOffset(months=i + 1)).strftime("%Y-%m")
+                forecast_data.append({
+                    "month": next_month,
+                    "predicted_revenue": round(float(max(0, pred)), 2)
+                })
 
+       # ======================
+        # Category Analysis (Smart: Category -> Product Fallback)
+        # ======================
+        total_p_sum = total_profit if total_profit else 1.0
+        cat_analysis = {}
+        
+        # Determine which column to analyze: priority given to category, otherwise we use product.
+        analysis_col = category_col if category_col else product
+
+        if analysis_col:
+            # Profit aggregation based on the selected column
+            cat_profit_df = df.groupby(analysis_col)["profit"].sum().fillna(0).reset_index().sort_values("profit", ascending=False)
+            top_5_cat = cat_profit_df.head(5)
+            accumulated_pct = 0.0
+            
+            for _, row in top_5_cat.iterrows():
+                c_name = str(row[analysis_col])
+                c_profit = float(row["profit"])
+                pct = round((c_profit / total_p_sum) * 100, 2)
+                accumulated_pct += pct
+                
+                cat_analysis[c_name] = {
+                    "contribution": f"{pct}%",
+                    "status": "Market Leader" if pct > 20 else "Stable Growth",
+                    "action": "Inventory Priority" if pct > 20 else "Market Expansion"
+                }
+                
+            if len(cat_profit_df) > 5:
+                rem_pct = round(100.0 - accumulated_pct, 2)
+                if rem_pct > 0:
+                    cat_analysis["Others"] = {
+                        "contribution": f"{rem_pct}%",
+                        "status": "Diversified",
+                        "action": "Monitor Portfolio"
+                    }
+
+        # Smart Recommendation Engine Logic
         recommendations = []
         if profit_margin < 20: recommendations.append("Reduce costs to improve profit margin")
-        if growth is not None and growth < 0: recommendations.append("Increase marketing campaigns")
-        if worst_product: recommendations.append(f"Review {worst_product} performance")
+        if growth < 0: recommendations.append("Increase marketing campaigns to reverse negative growth")
+            
+        if product:
+            low_profit_df = product_profit.sort_values(by="profit", ascending=True).head(2)
+            for _, row in low_profit_df.iterrows():
+                p_name = row["productName"]
+                if row["profit"] <= 0:
+                    recommendations.append(f"Stop Loss Alert: Product '{p_name}' has negative/zero margin. Review supplier price or increase selling price.")
+                else:
+                    recommendations.append(f"Promotional Action: Product '{p_name}' has weak profits. Consider a limited-time discount to activate sales.")
+            
+            if qty_col:
+                product_qty = df.groupby(product)[qty_col].sum().reset_index()
+                low_qty_df = product_qty.sort_values(by=qty_col, ascending=True).head(2)
+                for _, row in low_qty_df.iterrows():
+                    recommendations.append(f"Low Inventory Alert: Product '{row[product]}' has low stock. Reorder immediately.")
+                    
         recommendations.append("Focus on high-profit products")
 
-        # ======================
-# ======================
-        # Final JSON Response
-        # ======================
+        # Response Structure
         result = {
             "status": "success",
             "cards": [
@@ -206,60 +231,43 @@ def analyze_data(file_path, start_date=None, end_date=None):
                 {"id": "worstProduct", "label": "Worst Product", "value": worst_product, "format": "text"}
             ],
             "charts": {
-                "salesOverTime": {
-                    "type": "line",
-                    "title": "Sales Over Time",
-                    "xKey": "month",
-                    "yKey": "revenue",
-                    "yLabel": "Revenue ($)",
-                    "data": sales_over_time
-                },
-                "profitOverTime": {
-                    "type": "line",
-                    "title": "Profit Over Time",
-                    "xKey": "month",
-                    "yKey": "profit",
-                    "yLabel": "Profit ($)",
-                    "data": profit_over_time
-                },
-                "topProductsByProfit": {
-                    "type": "bar",
-                    "title": "Top 20 Products by Profit",
-                    "xKey": "productName",
-                    "yKey": "profit",
-                    "yLabel": "Profit ($)",
-                    "data": top_products
-                },
-                "bottomProductsByProfit": {
-                    "type": "bar",
-                    "title": "Bottom 20 Products by Profit",
-                    "xKey": "productName",
-                    "yKey": "profit",
-                    "yLabel": "Profit ($)",
-                    "data": bottom_products
-                },
-                "salesByRegion": {
-                    "type": "pie",
-                    "title": f"Sales by {str(region).title()}" if region else "Sales by Region",
-                    "nameKey": "region",
-                    "valueKey": "revenue",
-                    "data": sales_by_region
-                }
+                "salesOverTime": { "type": "line", "title": "Sales Over Time", "xKey": "month", "yKey": "revenue", "yLabel": "Revenue ($)", "data": sales_over_time },
+                "revenueForecast": { "type": "line", "title": "Revenue Forecast (Next 3 Months)", "xKey": "month", "yKey": "predicted_revenue", "yLabel": "Expected Revenue ($)", "data": forecast_data },
+                "profitOverTime": { "type": "line", "title": "Profit Over Time", "xKey": "month", "yKey": "profit", "yLabel": "Profit ($)", "data": profit_over_time },
+                "topProductsByProfit": { "type": "bar", "title": "Top Products by Profit", "xKey": "productName", "yKey": "profit", "yLabel": "Profit ($)", "data": top_products },
+                "bottomProductsByProfit": { "type": "bar", "title": "Bottom Products by Profit", "xKey": "productName", "yKey": "profit", "yLabel": "Profit ($)", "data": bottom_products },
+                "salesByRegion": { "type": "pie", "title": f"Sales by {str(region).title()}" if region else "Sales by Region", "nameKey": "region", "valueKey": "revenue", "data": sales_by_region }
             },
-            "insights": insights,
-            "recommendations": recommendations,
+            "insights_analysis": {
+                "title": "Strategic Business Insights",
+                "data": [
+                    { "id": 1, "header": "Revenue Velocity", "insight": f"Revenue momentum shifted by {round(growth, 2)}% compared to the previous period." },
+                    { "id": 2, "header": "Profit Leadership", "insight": f"Strategic product {best_product if best_product else 'N/A'} is driving the majority of net gains." },
+                    { "id": 3, "header": "Operational Health", "insight": f"Detected {int(outliers_detected)} sales anomalies that require auditing for margin consistency." }
+                ]
+            },
+            "category_analysis": cat_analysis,
+            "recommendations_plan": {
+                "title": "VELOX Strategic Action Plan",
+                "actions": recommendations
+            },
             "dataQuality": {
-                "missingPercentage": round(float(missing_percentage), 2),
+                "score": f"{round(100 - missing_percentage, 2)}%",
                 "duplicatesRemoved": int(duplicates_removed),
-                "outliersRemoved": int(outliers_detected)  # المتغير الصح عشان الإيرور بتاع التوتال
+                "anomaliesDetected": int(outliers_detected)
             }
         }
-
         return result
-
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+# ======================
+# TEST CODE
+# ======================
+# test_file_name = "Sample_3.csv" 
+# output = analyze_data(test_file_name)
+# print(json.dumps(output, indent=4, ensure_ascii=False))
     
-if __name__ == "__main__":
-    result = analyze_data("Sample_3.csv")  # or "your_file.xlsx"
-    print(result)
+# if __name__ == "__main__":
+#     result = analyze_data("Sample_3.csv")  # or "your_file.xlsx"
+#     print(result)

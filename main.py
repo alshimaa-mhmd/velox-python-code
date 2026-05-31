@@ -4,15 +4,23 @@ from supabase import create_client
 import tempfile
 import pandas as pd
 import json
-
-
 from analysis import analyze_data
+import os
+from dotenv import load_dotenv
+from pydantic import BaseModel
+from typing import List
+from google import genai
+from google.genai import types
+load_dotenv()
 
+
+client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 # =========================
 # Supabase Config
 # =========================
-SUPABASE_URL = "https://lrgdipbkedultkaknebq.supabase.co"
-SUPABASE_KEY = "sb_publishable_rZHGwdtzJKorc29-5jcpIA_ZN86cib0"
+SUPABASE_URL =  os.getenv("SUPABASE_URL")
+SUPABASE_KEY =  os.getenv("SUPABASE_SERVICE_KEY")
+
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -36,7 +44,6 @@ app.add_middleware(
 def home():
     return {"message": "API is running 🚀"}
 
-# =========================
 # Start Job
 # =========================
 @app.post("/analyze/{job_id}")
@@ -217,3 +224,126 @@ def run_analysis(job_id: str):
     }).eq("id", job_id).execute()
 
     print(f"🎉 Job completed: {job_id}")
+
+    # AI Model Endpoint (for testing)
+class ChatMessage(BaseModel):
+    role: str   # "user" or "assistant"
+    content: str
+
+class ChatRequest(BaseModel):
+    job_id: str | None = None   # optional — if None, chatbot has no data context
+    messages: List[ChatMessage]
+
+@app.post("/chat")
+async def chat(req: ChatRequest):
+    context_block = ""
+
+    if req.job_id:
+        try:
+            result_row = supabase.table("result") \
+                .select("result_data, summary") \
+                .eq("job_id", req.job_id) \
+                .single() \
+                .execute().data
+
+            if result_row and result_row.get("result_data"):
+                result_data = result_row["result_data"]
+
+                cards = {c["label"]: c["value"] for c in result_data.get("cards", [])}
+                regions = result_data.get("charts", {}).get("salesByRegion", {}).get("data", [])
+                top_products = result_data.get("charts", {}).get("topProductsByProfit", {}).get("data", [])
+                bottom_products = result_data.get("charts", {}).get("bottomProductsByProfit", {}).get("data", [])
+                insights = result_data.get("insights", [])
+                recommendations = result_data.get("recommendations", [])
+                quality = result_data.get("dataQuality", {})
+
+                # Format lists safely outside the main f-string to prevent parsing bugs
+                regions_text = "\n".join(f"- {r['region']}: ${r['revenue']:,.2f}" for r in regions)
+                top_p_text = "\n".join(f"- {p['productName']}: ${p['profit']:,.2f}" for p in top_products[:5])
+                bottom_p_text = "\n".join(f"- {p['productName']}: ${p['profit']:,.2f}" for p in bottom_products[:5])
+                insights_text = "\n".join(f"- {i}" for i in insights)
+                rec_text = "\n".join(f"- {r}" for r in recommendations)
+
+                context_block = f"""
+The user's sales analysis results:
+
+## Key Metrics
+- Total Revenue: ${cards.get('Total Revenue', 0):,.2f}
+- Total Profit: ${cards.get('Total Profit', 0):,.2f}
+- Profit Margin: {cards.get('Profit Margin %', 0)}%
+- Total Orders: {int(cards.get('Total Orders', 0)):,}
+- Best Product: {cards.get('Best Product', 'N/A')}
+- Worst Product: {cards.get('Worst Product', 'N/A')}
+
+## Sales by Region
+{regions_text}
+
+## Top 5 Products by Profit
+{top_p_text}
+
+## Bottom 5 Products by Profit (Losing Money)
+{bottom_p_text}
+
+## Insights
+{insights_text}
+
+## Recommendations
+{rec_text}
+
+## Data Quality
+- Outliers removed: {quality.get('outliersRemoved', 0)}
+- Duplicates removed: {quality.get('duplicatesRemoved', 0)}
+- Missing data: {quality.get('missingPercentage', 0)}%
+
+Answer the user's questions using this data. Be specific with numbers.
+"""
+            else:
+                context_block = "The user has a job submitted but the analysis result is not available yet."
+        except Exception as e:
+            print("⚠️ Could not fetch result for chat context:", e)
+            context_block = "No analysis data is available at this time."
+    else:
+        context_block = "No sales data has been uploaded yet."
+
+    system_prompt = f"""You are a helpful business analyst assistant embedded in a sales analytics platform.
+Your job is to help users understand their sales data and business performance.
+
+{context_block}
+
+Guidelines:
+- If you have analysis data, ground your answers in it. Be specific with numbers and metrics.
+- If no data is available, be transparent and still offer general advice.
+- Keep answers concise and friendly.
+- If the user asks something unrelated to sales/business, gently steer back.
+"""
+
+    # -------------------------
+    # Modern Gemini Client Call
+    # -------------------------
+    try:
+        # Convert incoming message history into the structure the modern SDK expects
+        formatted_contents = []
+        for m in req.messages:
+            role_string = "user" if m.role == "user" else "model"
+            formatted_contents.append(
+                types.Content(
+                    role=role_string,
+                    parts=[types.Part.from_text(text=m.content)]
+                )
+            )
+
+        # Generate content using the new client format
+        response = client.models.generate_content(
+            model='gemini-2.5-flash', # Updated to the standard, stable model tier
+            contents=formatted_contents,
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt
+            )
+        )
+        
+        return {"reply": response.text}
+
+    except Exception as e:
+        print("❌ Gemini API error:", e)
+        return {"reply": "Sorry, I'm having trouble responding right now. Please try again."}# =========================
+# =========================
